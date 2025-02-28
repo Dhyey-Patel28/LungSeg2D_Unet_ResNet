@@ -175,7 +175,7 @@ def training_job():
     )
     HF.visualize_image_and_mask(
         X_val_batch[sample_val_idx][:, :, 0],
-        Y_pred_thresholded[sample_val_idx][:, :, 0],
+        Y_pred_batch[sample_val_idx][:, :, 0],
         title="Prediction"
     )
     
