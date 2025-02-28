@@ -13,7 +13,6 @@ from scipy.io import savemat
 from sklearn.model_selection import train_test_split
 import seaborn as sns
 
-# If you want Hausdorff distance, install medpy:
 try:
     from medpy.metric.binary import hd
     USE_MEDPY = True
@@ -23,10 +22,10 @@ except ImportError:
 
 # TensorFlow / Keras Imports
 import tensorflow as tf
-from tensorflow.keras import backend as K
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras import utils as keras_utils
+from keras import backend as K
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+from keras.optimizers import Adam
+from keras import utils as keras_utils
 if not hasattr(keras_utils, "generic_utils"):
     keras_utils.generic_utils = type("dummy", (), {"get_custom_objects": keras_utils.get_custom_objects})
 
@@ -34,7 +33,7 @@ if not hasattr(keras_utils, "generic_utils"):
 import segmentation_models as sm
 
 # Local Modules
-import HelpFunctions as HF  # Contains NiftiSequence and helper functions for saving masks/plots
+import HelpFunctions as HF  # Contains SliceSequence and helper functions
 from matplotlib.widgets import Slider  # For interactive visualization
 
 # Import configuration
@@ -52,21 +51,21 @@ def training_job():
     os.makedirs(output_dir, exist_ok=True)
 
     # -------------------- DATA GENERATION --------------------
-    # Build list of subject directories from DATA_PATH
+    # Build list of subject directories from DATA_PATH.
+    # Each subject directory is assumed to now contain saved slice files in 'proton' and 'mask' subfolders.
     subject_dirs = [os.path.join(cfg.DATA_PATH, d) for d in os.listdir(cfg.DATA_PATH)
                     if os.path.isdir(os.path.join(cfg.DATA_PATH, d))]
     print("Total subjects found:", len(subject_dirs))
     
-    # Split subject directories into training and validation sets
+    # Split subject directories into training and validation sets.
     train_dirs, val_dirs = train_test_split(subject_dirs, test_size=cfg.TRAIN_TEST_SPLIT, random_state=42)
     print("Train subjects:", len(train_dirs))
     print("Validation subjects:", len(val_dirs))
     
     # -------------------- GENERATORS --------------------
-    # Note: If each subject has 220–288 slices, a large batch size (e.g. 16) will load thousands of images at once.
-    # To mitigate memory issues, consider reducing cfg.BATCH_SIZE in config.py.
-    train_generator = HF.NiftiSequence(
-        train_dirs,
+    # Use the SliceSequence data generator which loads individual slice files.
+    train_generator = HF.SliceSequence(
+        slice_dirs=train_dirs,
         batch_size=cfg.BATCH_SIZE,
         image_size=cfg.IMAGE_SIZE,
         img_aug=cfg.IMG_AUGMENTATION,
@@ -75,8 +74,8 @@ def training_job():
         shuffle=True
     )
     
-    val_generator = HF.NiftiSequence(
-        val_dirs,
+    val_generator = HF.SliceSequence(
+        slice_dirs=val_dirs,
         batch_size=cfg.BATCH_SIZE,
         image_size=cfg.IMAGE_SIZE,
         img_aug=cfg.IMG_AUGMENTATION,
@@ -86,7 +85,6 @@ def training_job():
     )
     
     # Optionally visualize a few augmented samples from the training generator.
-    # (Since Sequence objects are not iterators, we sample a random batch via indexing.)
     HF.visualize_augmented_samples_overlay(train_generator, num_samples=5)
     HF.visualize_augmented_samples(train_generator, num_samples=2)
     
@@ -138,29 +136,33 @@ def training_job():
     # -------------------- PREDICTION & MASK SAVING --------------------
     Y_pred_all = model.predict(val_generator, steps=len(val_generator))
     if Y_pred_all.shape[0] > 0:
-        # Convert predictions to a volume (squeeze the channel dimension and transpose so that slices are along the 3rd dimension)
-        pred_volume = np.transpose(Y_pred_all.squeeze(-1), (1, 2, 0))
+        # Apply thresholding to convert soft probability outputs into binary masks
+        Y_pred_all_thresh = (Y_pred_all > 0.5).astype(np.uint8)
+        # Convert the thresholded predictions into a volume:
+        pred_volume = np.transpose(Y_pred_all_thresh.squeeze(-1), (1, 2, 0))
         masks_dir = os.path.join(output_dir, "masks")
         os.makedirs(masks_dir, exist_ok=True)
         HF.save_masks(pred_volume,
-                      mat_path=os.path.join(output_dir, "final_gen_mask.mat"),
-                      nifti_path=os.path.join(output_dir, "final_gen_mask.nii.gz"),
-                      png_dir=masks_dir)
+                    mat_path=os.path.join(output_dir, "final_gen_mask.mat"),
+                    nifti_path=os.path.join(output_dir, "final_gen_mask.nii.gz"),
+                    png_dir=masks_dir)
     else:
         print("No predictions were made; skipping mask saving.")
+
     
     # -------------------- EVALUATION & VISUALIZATION ON ONE BATCH --------------------
     batch_idx = random.randint(0, len(val_generator) - 1)
     X_val_batch, Y_val_batch = val_generator[batch_idx]
-    Y_pred_batch = model.predict(X_val_batch)
-    
+    Y_pred_batch_probs = model.predict(X_val_batch)
+    # Immediately threshold the predictions:
+    Y_pred_batch = (Y_pred_batch_probs > 0.5).astype(np.uint8)
+
     HF.plot_validation_dice(Y_val_batch, Y_pred_batch, output_dir=plots_dir)
-    
-    Y_pred_thresholded = (Y_pred_batch > 0.5).astype(np.uint8)
+
     HF.evaluate_and_save_segmentation_plots(
         Y_true=Y_val_batch,
         Y_pred_probs=Y_pred_batch,
-        Y_pred_bin=Y_pred_thresholded,
+        Y_pred_bin=Y_pred_batch,
         output_dir=plots_dir,
         prefix="val"
     )

@@ -8,6 +8,7 @@ from scipy.io import savemat
 from sklearn.metrics import roc_curve, auc, confusion_matrix
 import seaborn as sns
 from tensorflow.keras.utils import Sequence
+import tensorflow as tf  # Needed for tf.keras.preprocessing.image.ImageDataGenerator
 
 try:
     from medpy.metric.binary import hd
@@ -17,127 +18,172 @@ except ImportError:
     USE_MEDPY = False
 
 # ---------------------------------------------------------------------
-# Data Generator for loading NIfTI volumes using Keras Sequence
+# Function to save individual slices from a 3D volume
 # ---------------------------------------------------------------------
-class NiftiSequence(Sequence):
-    def __init__(self, subject_dirs, batch_size, image_size, 
+def save_individual_slices(subject_dir, output_dir, image_size, max_slices=16):
+    """
+    Opens the proton and mask NIfTI volumes from subject_dir,
+    resizes them to (image_size x image_size), and saves individual slice images.
+    
+    The output directory will be organized as:
+      output_dir/
+          proton/   -> saved proton slice PNGs
+          mask/     -> saved mask slice PNGs
+    Only up to max_slices slices are saved per subject.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    proton_output = os.path.join(output_dir, 'proton')
+    mask_output = os.path.join(output_dir, 'mask')
+    os.makedirs(proton_output, exist_ok=True)
+    os.makedirs(mask_output, exist_ok=True)
+    
+    proton_file = _find_proton_file(subject_dir)
+    mask_file = _find_mask_file(subject_dir)
+    if proton_file is None or mask_file is None:
+        print(f"Skipping {subject_dir}: missing proton or mask file.")
+        return
+    
+    # Load volumes and convert to float32
+    proton_data = nib.load(proton_file).get_fdata().astype(np.float32)
+    mask_data = nib.load(mask_file).get_fdata().astype(np.float32)
+    
+    # Resize volumes (the third dimension—number of slices—is kept as is)
+    proton_data = resize(proton_data, (image_size, image_size, proton_data.shape[2]),
+                         mode='constant', preserve_range=True, order=1)
+    mask_data = resize(mask_data, (image_size, image_size, mask_data.shape[2]),
+                       mode='constant', preserve_range=True, order=0)
+    
+    # Use the minimum number of slices between proton and mask volumes
+    num_slices = min(proton_data.shape[2], mask_data.shape[2])
+    if num_slices > max_slices:
+        slice_indices = np.sort(np.random.choice(num_slices, max_slices, replace=False))
+    else:
+        slice_indices = np.arange(num_slices)
+    
+    for i in slice_indices:
+        proton_slice = proton_data[:, :, i]
+        mask_slice = (mask_data[:, :, i] > 0).astype(np.uint8)
+        proton_path = os.path.join(proton_output, f"proton_slice_{i:03d}.png")
+        mask_path = os.path.join(mask_output, f"mask_slice_{i:03d}.png")
+        plt.imsave(proton_path, proton_slice, cmap='gray')
+        plt.imsave(mask_path, mask_slice, cmap='gray')
+    print(f"Saved slices for subject {subject_dir} to {output_dir}")
+
+def _find_proton_file(subject_dir):
+    candidates = glob.glob(os.path.join(subject_dir, '*[Pp]roton*.*nii*'))
+    return candidates[0] if candidates else None
+
+def _find_mask_file(subject_dir):
+    candidates = glob.glob(os.path.join(subject_dir, '*[Mm]ask*.*nii*'))
+    for candidate in candidates:
+        if os.path.basename(candidate).lower() == "mask.nii":
+            return candidate
+    return candidates[0] if candidates else None
+
+# ---------------------------------------------------------------------
+# Data Generator for loading individual slice files using Keras Sequence
+# ---------------------------------------------------------------------
+class SliceSequence(Sequence):
+    def __init__(self, slice_dirs, batch_size, image_size, 
                  img_aug=None, mask_aug=None, augment=False, shuffle=True):
         """
-        subject_dirs: list of directories, one per subject
-        batch_size: number of subjects per batch (subject-level batching)
-        image_size: target image size (assumed square)
-        img_aug: dictionary of image augmentation parameters (from config)
-        mask_aug: dictionary of mask augmentation parameters (from config)
-        augment: Boolean flag to apply augmentation or not
-        shuffle: whether to shuffle the order at the end of each epoch
+        slice_dirs: list of directories, one per subject, where each directory contains
+                    two subfolders: 'proton' and 'mask' with individual slice PNG files.
+        batch_size: number of slice pairs per batch.
+        image_size: target image size (assumed square). Slices are loaded and resized if needed.
+        img_aug: dictionary of image augmentation parameters.
+        mask_aug: dictionary of mask augmentation parameters.
+        augment: Boolean flag to apply augmentation.
+        shuffle: whether to shuffle the slice file indices each epoch.
         """
-        self.subject_dirs = subject_dirs
+        self.slice_dirs = slice_dirs
         self.batch_size = batch_size
         self.image_size = image_size
         self.augment = augment
         self.shuffle = shuffle
-        self.indexes = np.arange(len(self.subject_dirs))
+        
+        # Build lists of slice file paths across all provided subject directories.
+        self.image_files = []
+        self.mask_files = []
+        for d in self.slice_dirs:
+            proton_dir = os.path.join(d, 'proton')
+            mask_dir = os.path.join(d, 'mask')
+            proton_files = sorted(glob.glob(os.path.join(proton_dir, '*.png')))
+            mask_files = sorted(glob.glob(os.path.join(mask_dir, '*.png')))
+            if len(proton_files) == len(mask_files):
+                self.image_files.extend(proton_files)
+                self.mask_files.extend(mask_files)
+            else:
+                print(f"Warning: Mismatch in number of slices in {d}")
+        self.indexes = np.arange(len(self.image_files))
         self.on_epoch_end()
         
         if self.augment:
-            from tensorflow.keras.preprocessing.image import ImageDataGenerator
-            self.img_datagen = ImageDataGenerator(**(img_aug if img_aug else {}))
-            self.mask_datagen = ImageDataGenerator(**(mask_aug if mask_aug else {}))
+            self.img_datagen = tf.keras.preprocessing.image.ImageDataGenerator(**(img_aug if img_aug else {}))
+            self.mask_datagen = tf.keras.preprocessing.image.ImageDataGenerator(**(mask_aug if mask_aug else {}))
     
     def __len__(self):
-        return int(np.ceil(len(self.subject_dirs) / self.batch_size))
+        return int(np.ceil(len(self.image_files) / self.batch_size))
     
     def __getitem__(self, index):
         batch_indexes = self.indexes[index*self.batch_size:(index+1)*self.batch_size]
-        batch_subjects = [self.subject_dirs[k] for k in batch_indexes]
-        X, Y = self.__data_generation(batch_subjects)
+        batch_img_files = [self.image_files[i] for i in batch_indexes]
+        batch_mask_files = [self.mask_files[i] for i in batch_indexes]
+        X, Y = self.__data_generation(batch_img_files, batch_mask_files)
         return X, Y
     
     def on_epoch_end(self):
         if self.shuffle:
             np.random.shuffle(self.indexes)
     
-    def __data_generation(self, batch_subjects):
+    def __data_generation(self, batch_img_files, batch_mask_files):
         X_batch = []
         Y_batch = []
         
-        # Define the maximum number of slices per subject to load.
-        # Adjust this number as needed.
-        max_slices_per_subject = 16
-
-        for subject_dir in batch_subjects:
-            proton_file = self._find_proton_file(subject_dir)
-            mask_file = self._find_mask_file(subject_dir)
-            if proton_file is None or mask_file is None:
-                continue
+        for img_file, mask_file in zip(batch_img_files, batch_mask_files):
+            img = plt.imread(img_file)
+            mask = plt.imread(mask_file)
             
-            # Load volumes and force them to be float32 to save memory.
-            proton_data = nib.load(proton_file).get_fdata().astype(np.float32)
-            mask_data = nib.load(mask_file).get_fdata().astype(np.float32)
-            
-            # Resize volumes to target image size (and keep all slices for now)
-            proton_data = resize(proton_data, (self.image_size, self.image_size, proton_data.shape[2]),
-                                mode='constant', preserve_range=True, order=1)
-            mask_data = resize(mask_data, (self.image_size, self.image_size, mask_data.shape[2]),
+            # Ensure images have a channel dimension
+            if img.ndim == 2:
+                img = np.expand_dims(img, axis=-1)
+            if mask.ndim == 2:
+                mask = np.expand_dims(mask, axis=-1)
+                
+            # Resize if necessary
+            if img.shape[0] != self.image_size or img.shape[1] != self.image_size:
+                img = resize(img, (self.image_size, self.image_size),
+                            mode='constant', preserve_range=True)
+                mask = resize(mask, (self.image_size, self.image_size),
                             mode='constant', preserve_range=True, order=0)
-            
-            # Ensure both volumes have the same number of slices
-            num_slices = min(proton_data.shape[2], mask_data.shape[2])
-            proton_data = proton_data[..., :num_slices]
-            mask_data = mask_data[..., :num_slices]
-            
-            # Randomly sample a fixed number of slices (if there are more than max_slices_per_subject)
-            if num_slices > max_slices_per_subject:
-                slice_indices = np.sort(np.random.choice(num_slices, max_slices_per_subject, replace=False))
-            else:
-                slice_indices = np.arange(num_slices)
-            
-            # Expand dims for channel (if not already)
-            proton_data = np.expand_dims(proton_data, axis=-1)
-            mask_data = np.expand_dims(mask_data, axis=-1)
-            
-            # Process only the selected slices
-            for i in slice_indices:
-                X_slice = proton_data[:, :, i, :]
-                Y_slice = (mask_data[:, :, i, :] > 0).astype(np.uint8)
                 
-                if self.augment:
-                    transform = self.img_datagen.get_random_transform(X_slice.shape)
-                    X_slice = self.img_datagen.apply_transform(X_slice, transform)
-                    Y_slice = self.mask_datagen.apply_transform(Y_slice, transform)
-                
-                X_batch.append(X_slice)
-                Y_batch.append(Y_slice)
-        
-        if len(X_batch) == 0:
-            return (np.empty((0, self.image_size, self.image_size, 3)),
-                    np.empty((0, self.image_size, self.image_size, 1)))
+            if self.augment:
+                transform = self.img_datagen.get_random_transform(img.shape)
+                img = self.img_datagen.apply_transform(img, transform)
+                # Force nearest-neighbor interpolation for the mask
+                mask = self.mask_datagen.apply_transform(mask, transform, order=0)
+            
+            X_batch.append(img)
+            Y_batch.append(mask)
         
         X_batch = np.stack(X_batch, axis=0)
         Y_batch = np.stack(Y_batch, axis=0)
-        # Replicate the single channel to 3 channels for images.
-        X_batch = np.repeat(X_batch, 3, axis=-1)
+        
+        # If images are single-channel, replicate to 3 channels.
+        if X_batch.shape[-1] == 1:
+            X_batch = np.repeat(X_batch, 3, axis=-1)
+            
         X_batch = X_batch.astype('float32') / 255.0
         Y_batch = Y_batch.astype('float32')
+        
         return X_batch, Y_batch
 
-    def _find_proton_file(self, subject_dir):
-        import glob
-        candidates = glob.glob(os.path.join(subject_dir, '*[Pp]roton*.*nii*'))
-        return candidates[0] if candidates else None
-    
-    def _find_mask_file(self, subject_dir):
-        import glob
-        candidates = glob.glob(os.path.join(subject_dir, '*[Mm]ask*.*nii*'))
-        for candidate in candidates:
-            if os.path.basename(candidate).lower() == "mask.nii":
-                return candidate
-        return candidates[0] if candidates else None
-
 # ---------------------------------------------------------------------
-# Other Utility Functions
+# Other Utility Functions (unchanged)
 # ---------------------------------------------------------------------
 def save_masks(final_mask, mat_path, nifti_path, png_dir):
+    # Apply thresholding to ensure binary masks
+    final_mask = (final_mask > 0.5).astype(np.uint8)
     savemat(mat_path, {"final_gen_mask": final_mask})
     print(f"Generated mask saved as {mat_path}.")
     nifti_img = nib.Nifti1Image(final_mask, affine=np.eye(4))
@@ -147,6 +193,7 @@ def save_masks(final_mask, mat_path, nifti_path, png_dir):
     for i in range(final_mask.shape[2]):
         plt.imsave(os.path.join(png_dir, f"slice_{i+1:03}.png"), final_mask[:, :, i], cmap='gray')
     print(f"Predicted slices saved as PNGs in {png_dir}.")
+
 
 def save_training_plots(history, output_dir):
     os.makedirs(output_dir, exist_ok=True)
@@ -196,7 +243,6 @@ def visualize_slice(image_volume, mask_volume, slice_idx, title_prefix=""):
 
 def visualize_augmented_samples(generator, num_samples=3):
     for _ in range(num_samples):
-        # Instead of next(), use __getitem__ with a random index
         idx = np.random.randint(0, len(generator))
         img_batch, mask_batch = generator[idx]
         plt.figure(figsize=(10, 5))

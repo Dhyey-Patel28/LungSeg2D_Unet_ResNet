@@ -44,7 +44,7 @@ IMG_AUGMENTATION, MASK_AUGMENTATION = get_augmentations()
 # TRAINING PARAMETERS
 # ====================================================
 BATCH_SIZE = 16 # Change to 12 if there are errors regarding OOM.
-NUM_EPOCHS = 5
+NUM_EPOCHS = 50
 TRAIN_TEST_SPLIT = 0.25
 LEARNING_RATE = 1e-4
 BACKBONE = 'resnet50'
