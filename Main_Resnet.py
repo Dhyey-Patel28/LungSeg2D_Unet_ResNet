@@ -3,6 +3,7 @@ os.environ["SM_FRAMEWORK"] = "tf.keras"  # Must be set before any other imports
 import random
 import time
 import datetime
+import cv2  # NEW: For overlay visualization
 
 # Third‑Party Libraries
 import numpy as np
@@ -23,7 +24,7 @@ except ImportError:
 # TensorFlow / Keras Imports
 import tensorflow as tf
 from keras import backend as K
-from keras.callbacks import EarlyStopping, ModelCheckpoint
+from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau  # NEW: Import scheduler
 from keras.optimizers import Adam
 from keras import utils as keras_utils
 if not hasattr(keras_utils, "generic_utils"):
@@ -120,6 +121,7 @@ def training_job():
         EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True),
         ModelCheckpoint(os.path.join(output_dir, 'best_model.keras'),
                         monitor='val_loss', save_best_only=True)
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, verbose=1)  # NEW: LR scheduler
     ]
     
     history = model.fit(
@@ -161,7 +163,7 @@ def training_job():
 
     HF.evaluate_and_save_segmentation_plots(
         Y_true=Y_val_batch,
-        Y_pred_probs=Y_pred_batch,
+        Y_pred_probs=Y_pred_batch_probs,
         Y_pred_bin=Y_pred_batch,
         output_dir=plots_dir,
         prefix="val"
@@ -179,6 +181,19 @@ def training_job():
         title="Prediction"
     )
     
+    # -------------------- NEW: OVERLAY VISUALIZATION --------------------
+    if cfg.SAVE_OVERLAY_IMAGES:
+        # Convert original image to uint8 format for contour detection
+        original_image = (X_val_batch[sample_val_idx][:, :, 0] * 255).astype(np.uint8)
+        # Ensure binary mask is in uint8 format
+        mask = (Y_pred_batch[sample_val_idx][:, :, 0] * 255).astype(np.uint8)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        overlay_image = cv2.cvtColor(original_image, cv2.COLOR_GRAY2BGR)
+        cv2.drawContours(overlay_image, contours, -1, cfg.OVERLAY_COLOR, 2)
+        overlay_save_path = os.path.join(plots_dir, "prediction_overlay.png")
+        cv2.imwrite(overlay_save_path, overlay_image)
+        print("Saved overlay image to", overlay_save_path)
+            
     # -------------------- SAVE MODEL --------------------
     model_save_path = os.path.join(output_dir, cfg.MODEL_SAVE_PATH_TEMPLATE.format(cfg.NUM_EPOCHS))
     model.save(model_save_path)

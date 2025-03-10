@@ -43,11 +43,11 @@ IMG_AUGMENTATION, MASK_AUGMENTATION = get_augmentations()
 # ====================================================
 # TRAINING PARAMETERS
 # ====================================================
-BATCH_SIZE = 16 # Change to 12 if there are errors regarding OOM.
-NUM_EPOCHS = 50
-TRAIN_TEST_SPLIT = 0.25
+BATCH_SIZE = 32 # Change to 12 if there are errors regarding OOM.
+NUM_EPOCHS = 100
+TRAIN_TEST_SPLIT = 0.20
 LEARNING_RATE = 1e-4
-BACKBONE = 'resnet50'
+BACKBONE = 'resnet34'
 
 # ====================================================
 # FILE SAVING & OUTPUT PARAMETERS
@@ -57,3 +57,7 @@ MATLAB_SAVE_X_TRAIN = 'Xe_X_train.mat'
 MATLAB_SAVE_X_VAL = 'Xe_X_val.mat'
 MATLAB_SAVE_Y_TRAIN = 'Xe_Y_train.mat'
 MATLAB_SAVE_Y_VAL = 'Xe_Y_val.mat'
+
+# New parameters for overlay visualization
+SAVE_OVERLAY_IMAGES = True
+OVERLAY_COLOR = (0, 255, 0)  # Green contour for overlays (OpenCV BGR format)
