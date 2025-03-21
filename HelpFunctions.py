@@ -9,6 +9,7 @@ from sklearn.metrics import roc_curve, auc, confusion_matrix
 import seaborn as sns
 from tensorflow.keras.utils import Sequence
 import tensorflow as tf  # Needed for tf.keras.preprocessing.image.ImageDataGenerator
+import cv2
 
 try:
     from medpy.metric.binary import hd
@@ -83,18 +84,18 @@ def _find_mask_file(subject_dir):
 # ---------------------------------------------------------------------
 # Data Generator for loading individual slice files using Keras Sequence
 # ---------------------------------------------------------------------
-class SliceSequence(Sequence):
+class NiftiSliceSequence(Sequence):
     def __init__(self, slice_dirs, batch_size, image_size, 
-                 img_aug=None, mask_aug=None, augment=False, shuffle=True):
+                 img_aug=None, mask_aug=None, augment=False, shuffle=True,
+                 max_slices_per_subject=None):
         """
-        slice_dirs: list of directories, one per subject, where each directory contains
-                    two subfolders: 'proton' and 'mask' with individual slice PNG files.
-        batch_size: number of slice pairs per batch.
-        image_size: target image size (assumed square). Slices are loaded and resized if needed.
-        img_aug: dictionary of image augmentation parameters.
-        mask_aug: dictionary of mask augmentation parameters.
-        augment: Boolean flag to apply augmentation.
-        shuffle: whether to shuffle the slice file indices each epoch.
+        slice_dirs: list of subject directories. Each should contain a proton NIfTI and a mask NIfTI.
+        batch_size: number of slices per batch.
+        image_size: target image size (assumed square); slices will be resized if needed.
+        img_aug, mask_aug: augmentation parameters (passed to tf.keras.preprocessing.image.ImageDataGenerator).
+        augment: whether to apply augmentation.
+        shuffle: whether to shuffle the samples.
+        max_slices_per_subject: Optional maximum number of slices to take from each subject.
         """
         self.slice_dirs = slice_dirs
         self.batch_size = batch_size
@@ -102,98 +103,162 @@ class SliceSequence(Sequence):
         self.augment = augment
         self.shuffle = shuffle
         
-        # Build lists of slice file paths across all provided subject directories.
-        self.image_files = []
-        self.mask_files = []
-        for d in self.slice_dirs:
-            proton_dir = os.path.join(d, 'proton')
-            mask_dir = os.path.join(d, 'mask')
-            proton_files = sorted(glob.glob(os.path.join(proton_dir, '*.png')))
-            mask_files = sorted(glob.glob(os.path.join(mask_dir, '*.png')))
-            if len(proton_files) == len(mask_files):
-                self.image_files.extend(proton_files)
-                self.mask_files.extend(mask_files)
-            else:
-                print(f"Warning: Mismatch in number of slices in {d}")
-        self.indexes = np.arange(len(self.image_files))
-        self.on_epoch_end()
+        # This list will hold one dictionary per slice sample.
+        self.samples = []
         
+        for d in self.slice_dirs:
+            patient_id = os.path.basename(d)
+            proton_file = self._find_proton_file(d)
+            mask_file = self._find_mask_file(d)
+            if proton_file is None or mask_file is None:
+                print(f"Skipping {d}: missing proton or mask file.")
+                continue
+            
+            # Load the NIfTI volumes.
+            proton_vol = nib.load(proton_file).get_fdata().astype(np.float32)
+            mask_vol = nib.load(mask_file).get_fdata().astype(np.float32)
+            
+            # Determine the number of slices (assume third dimension is slices)
+            num_slices = min(proton_vol.shape[2], mask_vol.shape[2])
+            if max_slices_per_subject is not None and num_slices > max_slices_per_subject:
+                slice_indices = np.sort(np.random.choice(num_slices, max_slices_per_subject, replace=False))
+            else:
+                slice_indices = np.arange(num_slices)
+            
+            for i in slice_indices:
+                # Extract a slice from each volume.
+                proton_slice = proton_vol[:, :, i]
+                mask_slice = mask_vol[:, :, i]
+                # Optionally, binarize the mask (if not already binary)
+                mask_slice = (mask_slice > 0).astype(np.uint8)
+                # Resize slices if needed
+                if proton_slice.shape[0] != image_size or proton_slice.shape[1] != image_size:
+                    proton_slice = resize(proton_slice, (image_size, image_size),
+                                          mode='constant', preserve_range=True)
+                    mask_slice = resize(mask_slice, (image_size, image_size),
+                                        mode='constant', preserve_range=True, order=0)
+                # Save the sample (store the raw slices and metadata)
+                self.samples.append({
+                    "patient_id": patient_id,
+                    "slice_number": i,
+                    "proton": proton_slice,  # raw 2D image
+                    "mask": mask_slice,       # raw binary mask
+                    "image_path": proton_file  # add the NIfTI file path for reference
+                })
+
+        # Set up augmentation if requested.
         if self.augment:
             self.img_datagen = tf.keras.preprocessing.image.ImageDataGenerator(**(img_aug if img_aug else {}))
             self.mask_datagen = tf.keras.preprocessing.image.ImageDataGenerator(**(mask_aug if mask_aug else {}))
+        
+        self.on_epoch_end()
     
     def __len__(self):
-        return int(np.ceil(len(self.image_files) / self.batch_size))
+        return int(np.ceil(len(self.samples) / self.batch_size))
     
     def __getitem__(self, index):
-        batch_indexes = self.indexes[index*self.batch_size:(index+1)*self.batch_size]
-        batch_img_files = [self.image_files[i] for i in batch_indexes]
-        batch_mask_files = [self.mask_files[i] for i in batch_indexes]
-        X, Y = self.__data_generation(batch_img_files, batch_mask_files)
-        return X, Y
-    
-    def on_epoch_end(self):
-        if self.shuffle:
-            np.random.shuffle(self.indexes)
-    
-    def __data_generation(self, batch_img_files, batch_mask_files):
+        batch_samples = self.samples[index*self.batch_size:(index+1)*self.batch_size]
         X_batch = []
         Y_batch = []
-        
-        for img_file, mask_file in zip(batch_img_files, batch_mask_files):
-            img = plt.imread(img_file)
-            mask = plt.imread(mask_file)
-            
-            # Ensure images have a channel dimension
+        for sample in batch_samples:
+            img = sample["proton"]
+            mask = sample["mask"]
+            # Add channel dimensions if needed
             if img.ndim == 2:
                 img = np.expand_dims(img, axis=-1)
             if mask.ndim == 2:
                 mask = np.expand_dims(mask, axis=-1)
-                
-            # Resize if necessary
-            if img.shape[0] != self.image_size or img.shape[1] != self.image_size:
-                img = resize(img, (self.image_size, self.image_size),
-                            mode='constant', preserve_range=True)
-                mask = resize(mask, (self.image_size, self.image_size),
-                            mode='constant', preserve_range=True, order=0)
-                
+            # If augmentation is enabled, apply the same random transform to both.
             if self.augment:
                 transform = self.img_datagen.get_random_transform(img.shape)
                 img = self.img_datagen.apply_transform(img, transform)
-                # Force nearest-neighbor interpolation for the mask
-                mask = self.mask_datagen.apply_transform(mask, transform, order=0)
-            
+                mask = self.mask_datagen.apply_transform(mask, transform)
+                # Threshold the mask to ensure binary values (nearest-neighbor-like behavior)
+                mask = (mask > 0.5).astype(np.uint8)
             X_batch.append(img)
             Y_batch.append(mask)
-        
         X_batch = np.stack(X_batch, axis=0)
         Y_batch = np.stack(Y_batch, axis=0)
-        
-        # If images are single-channel, replicate to 3 channels.
+        # If input images are single channel but the model expects 3 channels, replicate.
         if X_batch.shape[-1] == 1:
             X_batch = np.repeat(X_batch, 3, axis=-1)
-            
+        # Normalize input images (assumed to be in range 0-255).
         X_batch = X_batch.astype('float32') / 255.0
         Y_batch = Y_batch.astype('float32')
-        
         return X_batch, Y_batch
+    
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.samples)
+    
+    def get_meta_info(self):
+        """Return metadata for all samples in the same order as self.samples."""
+        meta = []
+        for sample in self.samples:
+            meta.append({
+                "patient_id": sample["patient_id"],
+                "slice_number": sample["slice_number"],
+                "image_path": sample.get("image_path", "N/A")
+            })
+        return meta
+    
+    def _find_proton_file(self, subject_dir):
+        # Look for files with 'proton' in the name and .nii or .nii.gz extension.
+        candidates = glob.glob(os.path.join(subject_dir, '*[Pp]roton*.nii*'))
+        return candidates[0] if candidates else None
+    
+    def _find_mask_file(self, subject_dir):
+        # Look for files with 'mask' in the name and .nii or .nii.gz extension.
+        candidates = glob.glob(os.path.join(subject_dir, '*[Mm]ask*.nii*'))
+        # Prefer an exact match if possible.
+        for candidate in candidates:
+            base = os.path.basename(candidate).lower()
+            if base in ["mask.nii", "mask.nii.gz"]:
+                return candidate
+        return candidates[0] if candidates else None
 
 # ---------------------------------------------------------------------
 # Other Utility Functions (unchanged)
 # ---------------------------------------------------------------------
-def save_masks(final_mask, mat_path, nifti_path, png_dir):
+def save_masks(final_mask, mat_path, nifti_path, png_dir, meta_info=None):
     # Apply thresholding to ensure binary masks
     final_mask = (final_mask > 0.5).astype(np.uint8)
+    
+    # Save .mat file
     savemat(mat_path, {"final_gen_mask": final_mask})
     print(f"Generated mask saved as {mat_path}.")
+    
+    # Save NIfTI image
     nifti_img = nib.Nifti1Image(final_mask, affine=np.eye(4))
     nib.save(nifti_img, nifti_path)
     print(f"Generated mask saved as {nifti_path}.")
+    
     os.makedirs(png_dir, exist_ok=True)
     for i in range(final_mask.shape[2]):
-        plt.imsave(os.path.join(png_dir, f"slice_{i+1:03}.png"), final_mask[:, :, i], cmap='gray')
+        # Build the file path for this slice
+        image_path = os.path.join(png_dir, f"slice_{i+1:03}.png")
+        
+        # Save the image using matplotlib
+        plt.imsave(image_path, final_mask[:, :, i], cmap='gray')
+        
+        # If metadata is provided, overlay text on the image
+        if meta_info is not None and i < len(meta_info):
+            # Load the image with OpenCV
+            image = cv2.imread(image_path)
+            # Create the overlay text from metadata
+            overlay_text = f"Patient: {meta_info[i]['patient_id']}  Slice: {meta_info[i]['slice_number']}"
+            # Define text properties
+            position = (10, 30)  # Top-left corner
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.3
+            color = (0, 0, 255)  # Red in BGR
+            thickness = 1
+            # Add the text overlay
+            cv2.putText(image, overlay_text, position, font, font_scale, color, thickness, cv2.LINE_AA)
+            # Save the image back to disk
+            cv2.imwrite(image_path, image)
+    
     print(f"Predicted slices saved as PNGs in {png_dir}.")
-
 
 def save_training_plots(history, output_dir):
     os.makedirs(output_dir, exist_ok=True)
@@ -326,13 +391,15 @@ def evaluate_and_save_segmentation_plots(Y_true, Y_pred_probs, Y_pred_bin, outpu
     plt.savefig(os.path.join(output_dir, f"{prefix}_ROC_curve.png"), dpi=300)
     plt.close()
     
+    # Compute and save normalized confusion matrix
+    from sklearn.metrics import confusion_matrix
     y_pred_flat = Y_pred_bin.flatten().astype(int)
-    cm = confusion_matrix(Y_true.flatten(), y_pred_flat, labels=[0, 1])
+    cm = confusion_matrix(y_true_flat, y_pred_flat, labels=[0, 1], normalize="true")
     plt.figure(figsize=(5, 4))
-    sns.heatmap(cm, annot=True, fmt="d", cmap='Blues',
+    sns.heatmap(cm, annot=True, fmt=".2f", cmap='Blues',
                 xticklabels=["Pred 0", "Pred 1"],
                 yticklabels=["True 0", "True 1"])
-    plt.title("Confusion Matrix")
+    plt.title("Normalized Confusion Matrix")
     plt.savefig(os.path.join(output_dir, f"{prefix}_confusion_matrix.png"), dpi=300)
     plt.close()
     
@@ -361,20 +428,29 @@ def evaluate_and_save_segmentation_plots(Y_true, Y_pred_probs, Y_pred_bin, outpu
     else:
         print("Hausdorff distance not computed because medpy is not installed.")
     
-    n_examples = 5
-    random_indices = np.random.choice(range(Y_true.shape[0]), size=n_examples, replace=False)
+    # --- Generate overlays for all slices with non-empty ground truth or prediction ---
     overlay_dir = os.path.join(output_dir, f"{prefix}_overlays")
     os.makedirs(overlay_dir, exist_ok=True)
-    for i in random_indices:
-        fig, ax = plt.subplots(1, 2, figsize=(8, 4))
-        ax[0].set_title("Ground Truth Overlay")
-        ax[0].imshow(Y_pred_probs[i], cmap='gray')
-        ax[0].imshow(Y_true[i], alpha=0.3, cmap='Reds')
-        ax[0].axis('off')
-        ax[1].set_title("Prediction Overlay")
-        ax[1].imshow(Y_pred_probs[i], cmap='gray')
-        ax[1].imshow(Y_pred_bin[i], alpha=0.3, cmap='Reds')
-        ax[1].axis('off')
-        plt.tight_layout()
-        plt.savefig(os.path.join(overlay_dir, f"overlay_{i:03d}.png"), dpi=200)
-        plt.close()
+    for i in range(Y_true.shape[0]):
+        # Only save overlay if there is some mask data in GT or prediction
+        if (Y_true[i] > 0.5).any() or (Y_pred_bin[i] > 0.5).any():
+            # Use the probability map as background (scale to 0-255 for display)
+            background = (Y_pred_probs[i] * 255).astype(np.uint8)
+            # Convert the background to BGR so we can draw colored contours
+            background_bgr = cv2.cvtColor(background, cv2.COLOR_GRAY2BGR)
+            # Get the contours from the predicted mask (convert to uint8 first)
+            pred_mask_uint8 = (Y_pred_bin[i] * 255).astype(np.uint8)
+            contours, _ = cv2.findContours(pred_mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Draw the contours in green with a thickness of 2
+            cv2.drawContours(background_bgr, contours, -1, (0, 255, 0), 2)
+            # Optionally, you can also overlay the ground truth in red (e.g., using transparency)
+            # For example:
+            gt_mask = (Y_true[i] * 255).astype(np.uint8)
+            gt_color = cv2.applyColorMap(gt_mask, cv2.COLORMAP_JET)
+            # Blend the two images (adjust alpha as desired)
+            alpha = 0.3
+            overlay = cv2.addWeighted(background_bgr, 1, gt_color, alpha, 0)
+            # Save the overlay image
+            overlay_path = os.path.join(overlay_dir, f"overlay_{i:03d}.png")
+            cv2.imwrite(overlay_path, overlay)
+    print("Saved overlay images for all non-empty slices.")

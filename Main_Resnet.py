@@ -2,9 +2,10 @@ import os
 os.environ["SM_FRAMEWORK"] = "tf.keras"  # Must be set before any other imports
 import random
 import time
+import csv
 import datetime
 import cv2  # NEW: For overlay visualization
-
+ 
 # Third‑Party Libraries
 import numpy as np
 import matplotlib.pyplot as plt
@@ -64,27 +65,28 @@ def training_job():
     print("Validation subjects:", len(val_dirs))
     
     # -------------------- GENERATORS --------------------
-    # Use the SliceSequence data generator which loads individual slice files.
-    train_generator = HF.SliceSequence(
+    # Use the NiftiSliceSequence data generator which loads individual slice files.
+    train_generator = HF.NiftiSliceSequence(
         slice_dirs=train_dirs,
         batch_size=cfg.BATCH_SIZE,
         image_size=cfg.IMAGE_SIZE,
         img_aug=cfg.IMG_AUGMENTATION,
         mask_aug=cfg.MASK_AUGMENTATION,
-        augment=True,    # Enable augmentation for training
-        shuffle=True
+        augment=True,
+        shuffle=True,
+        max_slices_per_subject=50  # optional: limit number of slices per subject
     )
     
-    val_generator = HF.SliceSequence(
+    val_generator = HF.NiftiSliceSequence(
         slice_dirs=val_dirs,
         batch_size=cfg.BATCH_SIZE,
         image_size=cfg.IMAGE_SIZE,
         img_aug=cfg.IMG_AUGMENTATION,
         mask_aug=cfg.MASK_AUGMENTATION,
-        augment=False,   # No augmentation for validation
+        augment=False,
         shuffle=False
     )
-    
+        
     # Optionally visualize a few augmented samples from the training generator.
     HF.visualize_augmented_samples_overlay(train_generator, num_samples=5)
     HF.visualize_augmented_samples(train_generator, num_samples=2)
@@ -101,10 +103,10 @@ def training_job():
     )
     
     def dice_loss(y_true, y_pred, smooth=1e-6):
-        y_true_f = K.flatten(y_true)
-        y_pred_f = K.flatten(y_pred)
-        intersection = K.sum(y_true_f * y_pred_f)
-        return 1 - (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
+        y_true_f = tf.reshape(y_true, [-1])
+        y_pred_f = tf.reshape(y_pred, [-1])
+        intersection = tf.reduce_sum(y_true_f * y_pred_f)
+        return 1 - (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
     
     def bce_dice_loss(y_true, y_pred):
         bce = tf.keras.losses.BinaryCrossentropy()(y_true, y_pred)
@@ -120,7 +122,7 @@ def training_job():
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True),
         ModelCheckpoint(os.path.join(output_dir, 'best_model.keras'),
-                        monitor='val_loss', save_best_only=True)
+                        monitor='val_loss', save_best_only=True),  # Added comma here
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, verbose=1)  # NEW: LR scheduler
     ]
     
@@ -144,10 +146,13 @@ def training_job():
         pred_volume = np.transpose(Y_pred_all_thresh.squeeze(-1), (1, 2, 0))
         masks_dir = os.path.join(output_dir, "masks")
         os.makedirs(masks_dir, exist_ok=True)
-        HF.save_masks(pred_volume,
-                    mat_path=os.path.join(output_dir, "final_gen_mask.mat"),
-                    nifti_path=os.path.join(output_dir, "final_gen_mask.nii.gz"),
-                    png_dir=masks_dir)
+        HF.save_masks(
+            pred_volume,
+            mat_path=os.path.join(output_dir, "final_gen_mask.mat"),
+            nifti_path=os.path.join(output_dir, "final_gen_mask.nii.gz"),
+            png_dir=masks_dir,
+            meta_info=val_generator.get_meta_info()  # Call the method instead of accessing a non-existent property
+        )
     else:
         print("No predictions were made; skipping mask saving.")
 
@@ -189,16 +194,75 @@ def training_job():
         mask = (Y_pred_batch[sample_val_idx][:, :, 0] * 255).astype(np.uint8)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         overlay_image = cv2.cvtColor(original_image, cv2.COLOR_GRAY2BGR)
-        cv2.drawContours(overlay_image, contours, -1, cfg.OVERLAY_COLOR, 2)
+        cv2.drawContours(overlay_image, contours, -1, (0, 255, 0), 2)
         overlay_save_path = os.path.join(plots_dir, "prediction_overlay.png")
         cv2.imwrite(overlay_save_path, overlay_image)
         print("Saved overlay image to", overlay_save_path)
+        
+    # This is a new block to generate overlays for ALL slices in the validation set
+    all_comparisons_dir = os.path.join(output_dir, "all_comparisons")
+    os.makedirs(all_comparisons_dir, exist_ok=True)
+    
+    # Loop over every batch in the validation generator
+    for batch_idx in range(len(val_generator)):
+        X_val_batch, Y_val_batch = val_generator[batch_idx]
+        Y_pred_batch_probs = model.predict(X_val_batch)
+        Y_pred_batch = (Y_pred_batch_probs > 0.5).astype(np.uint8)
+        
+        # Loop over every slice in this batch
+        for slice_idx in range(X_val_batch.shape[0]):
+            # Extract raw data, ground truth, and prediction
+            raw_image = X_val_batch[slice_idx, :, :, 0]     # single-channel slice
+            ground_truth = Y_val_batch[slice_idx, :, :, 0]
+            prediction = Y_pred_batch[slice_idx, :, :, 0]
+            
+            # Create side-by-side overlay
+            fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+            
+            ax[0].imshow(raw_image, cmap='gray')
+            ax[0].imshow(ground_truth, cmap='Reds', alpha=0.3)
+            ax[0].set_title("Ground Truth Overlay")
+            ax[0].axis('off')
+            
+            ax[1].imshow(raw_image, cmap='gray')
+            ax[1].imshow(prediction, cmap='Blues', alpha=0.3)
+            ax[1].set_title("Prediction Overlay")
+            ax[1].axis('off')
+            
+            # Save to a file named by batch_idx and slice_idx
+            comparison_filename = f"comparison_batch{batch_idx}_slice{slice_idx:03d}.png"
+            comparison_path = os.path.join(all_comparisons_dir, comparison_filename)
+            plt.savefig(comparison_path, dpi=300)
+            plt.close()
+    
+    print("Saved comparison overlays for all slices in validation set.")
             
     # -------------------- SAVE MODEL --------------------
     model_save_path = os.path.join(output_dir, cfg.MODEL_SAVE_PATH_TEMPLATE.format(cfg.NUM_EPOCHS))
     model.save(model_save_path)
     
     print("Training job completed. Outputs saved in:", output_dir)
+
+    # Assume you are using the validation generator (with shuffle disabled) so that order is maintained.
+    meta_info = val_generator.get_meta_info()  # Pass the metadata list
+
+    csv_file_path = os.path.join(output_dir, "mask_metadata.csv")
+    with open(csv_file_path, "w", newline="") as csvfile:
+        fieldnames = ["patient_id", "slice_number", "image_file", "mask_file"]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        # We assume that the saved individual slice PNG files are in the "masks" folder and are named as "slice_{i+1:03}.png"
+        for i, meta in enumerate(meta_info):
+            mask_filename = os.path.join("masks", f"slice_{i+1:03}.png")
+            writer.writerow({
+                "patient_id": meta["patient_id"],
+                "slice_number": meta["slice_number"],
+                "image_file": meta["image_path"],
+                "mask_file": mask_filename
+            })
+
+    print("Saved metadata CSV to", csv_file_path)
 
 def main():
     start_time = time.time()

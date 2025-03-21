@@ -9,7 +9,7 @@ OUTPUT_BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(_
 # DATA LOADING & PREPROCESSING PARAMETERS
 # ====================================================
 DATA_PATH = 'Neonatal Test Data - August 1 2024'
-DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), DATA_PATH)
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), DATA_PATH) 
 IMAGE_SIZE = 256  # assumed square images
 
 # ====================================================
@@ -43,8 +43,8 @@ IMG_AUGMENTATION, MASK_AUGMENTATION = get_augmentations()
 # ====================================================
 # TRAINING PARAMETERS
 # ====================================================
-BATCH_SIZE = 32 # Change to 12 if there are errors regarding OOM.
-NUM_EPOCHS = 100
+BATCH_SIZE = 16 # Change to 12 if there are errors regarding OOM.
+NUM_EPOCHS = 10
 TRAIN_TEST_SPLIT = 0.20
 LEARNING_RATE = 1e-4
 BACKBONE = 'resnet34'
