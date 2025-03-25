@@ -7,7 +7,7 @@ import nibabel as nib
 from scipy.io import savemat
 from sklearn.metrics import roc_curve, auc, confusion_matrix
 import seaborn as sns
-from tensorflow.keras.utils import Sequence
+from keras.utils import Sequence
 import tensorflow as tf  # Needed for tf.keras.preprocessing.image.ImageDataGenerator
 import cv2
 
@@ -272,15 +272,15 @@ def save_training_plots(history, output_dir):
     plt.legend()
     plt.savefig(os.path.join(output_dir, 'training_validation_loss.png'), dpi=300)
     plt.close()
-    plt.figure()
-    plt.plot(epochs, history.history['iou_score'], 'y', label='Training IoU')
-    plt.plot(epochs, history.history['val_iou_score'], 'r', label='Validation IoU')
-    plt.title('Training and Validation IoU')
-    plt.xlabel('Epochs')
-    plt.ylabel('IoU Score')
-    plt.legend()
-    plt.savefig(os.path.join(output_dir, 'training_validation_iou.png'), dpi=300)
-    plt.close()
+    # plt.figure()
+    # plt.plot(epochs, history.history['iou_score'], 'y', label='Training IoU')
+    # plt.plot(epochs, history.history['val_iou_score'], 'r', label='Validation IoU')
+    # plt.title('Training and Validation IoU')
+    # plt.xlabel('Epochs')
+    # plt.ylabel('IoU Score')
+    # plt.legend()
+    # plt.savefig(os.path.join(output_dir, 'training_validation_iou.png'), dpi=300)
+    # plt.close()
 
 def visualize_image_and_mask(image, mask, title="Image and Mask"):
     plt.figure(figsize=(8, 4))

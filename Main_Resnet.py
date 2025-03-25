@@ -114,8 +114,7 @@ def training_job():
         return bce + dsc
     
     model.compile(optimizer=Adam(learning_rate=cfg.LEARNING_RATE),
-                  loss=bce_dice_loss,
-                  metrics=[sm.metrics.iou_score])
+                  loss=bce_dice_loss)
     print(model.summary())
     
     # -------------------- MODEL TRAINING --------------------
