@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from skimage.transform import resize
 import nibabel as nib
 from scipy.io import savemat
+from scipy.ndimage import zoom
 from sklearn.metrics import roc_curve, auc, confusion_matrix
 import seaborn as sns
 from keras.utils import Sequence
@@ -106,6 +107,33 @@ def debug_validation_sample(generator, model):
     plt.pause(5)
     plt.close()
     
+def reorient_to_standard(img):
+    """
+    Reorients a nibabel NIfTI image to RAS (Right-Anterior-Superior) orientation.
+    This helps standardize the direction across subjects.
+    """
+    return nib.as_closest_canonical(img)
+
+def resample_to_voxel_size(nib_img, target_spacing=(1.0, 1.0, 1.0), order=1):
+    """
+    Resamples a nibabel image to the desired voxel spacing (default: 1mm x 1mm x 1mm).
+    `order`:
+      - 1 for linear (image)
+      - 0 for nearest-neighbor (mask)
+    """
+    original_spacing = nib_img.header.get_zooms()[:3]
+    original_shape = nib_img.shape
+    scale_factors = [orig / target for orig, target in zip(original_spacing, target_spacing)]
+    
+    img_data = nib_img.get_fdata()
+    resampled = zoom(img_data, zoom=scale_factors, order=order)
+    
+    new_affine = np.copy(nib_img.affine)
+    for i in range(3):
+        new_affine[i, i] *= original_spacing[i] / target_spacing[i]
+    
+    return resampled, new_affine
+    
 # ---------------------------------------------------------------------
 # Function to save individual slices from a 3D volume
 # ---------------------------------------------------------------------
@@ -133,8 +161,11 @@ def save_individual_slices(subject_dir, output_dir, image_size, max_slices=16):
         return
     
     # Load volumes and convert to float32
-    proton_data = nib.load(proton_file).get_fdata().astype(np.float32)
-    mask_data = nib.load(mask_file).get_fdata().astype(np.float32)
+    proton_img = reorient_to_standard(proton_img)
+    mask_img = reorient_to_standard(mask_img)
+    
+    proton_data, _ = resample_to_voxel_size(proton_img, target_spacing=(1.0, 1.0, 1.0), order=1)
+    mask_data, _ = resample_to_voxel_size(mask_img, target_spacing=(1.0, 1.0, 1.0), order=0)
     
     # Resize volumes (the third dimension—number of slices—is kept as is)
     proton_data = resize(proton_data, (image_size, image_size, proton_data.shape[2]),
