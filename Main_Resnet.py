@@ -150,14 +150,14 @@ def training_job():
         #   - patience=20: Wait 20 epochs without improvement before stopping training.
         #   - mode='max': Since a higher F1-score is better, we look for a maximum.
         #   - Disadvantage: If the metric fluctuates, training might stop prematurely, especially if the improvements are subtle.
-        EarlyStopping(monitor='val_f1-score', patience=20, mode='max', restore_best_weights=True),
+        EarlyStopping(monitor='val_loss', patience=20, mode='min', restore_best_weights=True),
 
         # ModelCheckpoint: Saves the model after every epoch if the monitored metric has improved.
         #   - monitor='val_f1-score', mode='max': Ensures we save the model with the best segmentation performance.
         #   - save_best_only=True: Saves only the best model, reducing storage overhead.
         #   - Disadvantage: If the metric is noisy, it might not update as frequently, and the 'best' model might be suboptimal.
-        ModelCheckpoint(os.path.join(output_dir, 'best_model.h5'),
-                        monitor='val_f1-score', mode='max', save_best_only=True),
+        ModelCheckpoint(os.path.join(output_dir, 'best_model.keras'),
+                        monitor='val_loss', mode='min', save_best_only=True),
 
         # ReduceLROnPlateau: Reduces the learning rate when the monitored metric (here, 'val_loss') has stopped improving.
         #   - monitor='val_loss': Uses validation loss as a signal for potential plateaus.
