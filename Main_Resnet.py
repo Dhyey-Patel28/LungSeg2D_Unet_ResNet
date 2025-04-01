@@ -199,12 +199,14 @@ def training_job():
         pred_volume = np.transpose(Y_pred_all_thresh.squeeze(-1), (1, 2, 0))
         masks_dir = os.path.join(output_dir, "masks")
         os.makedirs(masks_dir, exist_ok=True)
+        reference_path = val_generator.get_meta_info()[0]["image_path"] # Using the first validation image as reference for affine
         HF.save_masks(
             pred_volume,
             mat_path=os.path.join(output_dir, "final_gen_mask.mat"),
             nifti_path=os.path.join(output_dir, "final_gen_mask.nii.gz"),
             png_dir=masks_dir,
-            meta_info=val_generator.get_meta_info()  # Call the method instead of accessing a non-existent property
+            meta_info=val_generator.get_meta_info(),    # Call the method instead of accessing a non-existent property
+            reference_nifti_path=reference_path
         )
     else:
         print("No predictions were made; skipping mask saving.")
