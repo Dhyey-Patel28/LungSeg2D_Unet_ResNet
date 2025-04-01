@@ -161,6 +161,9 @@ def save_individual_slices(subject_dir, output_dir, image_size, max_slices=16):
         return
     
     # Load volumes and convert to float32
+    proton_img = nib.load(proton_file)
+    mask_img = nib.load(mask_file)
+
     proton_img = reorient_to_standard(proton_img)
     mask_img = reorient_to_standard(mask_img)
     
