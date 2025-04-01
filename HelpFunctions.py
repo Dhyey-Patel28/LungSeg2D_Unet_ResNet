@@ -358,7 +358,7 @@ class NiftiSliceSequence(Sequence):
 # ---------------------------------------------------------------------
 # Other Utility Functions (unchanged)
 # ---------------------------------------------------------------------
-def save_masks(final_mask, mat_path, nifti_path, png_dir, meta_info=None):
+def save_masks(final_mask, mat_path, nifti_path, png_dir, meta_info=None, reference_nifti_path=None):
     # Apply thresholding to ensure binary masks
     final_mask = (final_mask > 0.5).astype(np.uint8)
     
@@ -370,7 +370,14 @@ def save_masks(final_mask, mat_path, nifti_path, png_dir, meta_info=None):
     print(f"Generated mask saved as {mat_path}.")
     
     # Save NIfTI image
-    nifti_img = nib.Nifti1Image(final_mask, affine=np.eye(4))
+    if reference_nifti_path and os.path.exists(reference_nifti_path):
+        reference_img = nib.load(reference_nifti_path)
+        affine = reference_img.affine
+    else:
+        affine = np.eye(4)
+        
+    nifti_img = nib.Nifti1Image(final_mask, affine=affine)
+
     nib.save(nifti_img, nifti_path)
     print(f"Generated mask saved as {nifti_path}.")
     
